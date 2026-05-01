@@ -43,6 +43,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <optional>
 
 namespace clang {
 
@@ -91,11 +92,51 @@ public:
   friend class ASTDeclWriter;
   friend class ASTRecordWriter;
 
+  /// LURE-local: install the kept-set restricting which Decls reach the
+  /// preamble PCH. Single-shot; MUST be called BEFORE WriteAST runs
+  /// (PrecompilePreambleConsumer::HandleTranslationUnit is the canonical
+  /// caller). Decls outside the set get an invalid LocalDeclID() from
+  /// GetDeclRef and never reach the bitstream.
+  ///
+  /// CARMACK-LOCK: rvalue + move; never pass by value at the call site.
+  /// Plan section 4 originally specced this as a private setter behind
+  /// `friend class PrecompilePreambleAction`, but that class lives in
+  /// an anonymous namespace inside PrecompiledPreamble.cpp and cannot
+  /// be friended across TUs. Public-but-restricted-by-doc is the smaller
+  /// deviation than de-anonymizing the namespace; usage discipline is
+  /// enforced by call-site documentation + invariant comments.
+  void setEmittablePreambleDecls(
+      std::optional<llvm::DenseSet<const Decl *>> &&Kept);
+
   using RecordData = SmallVector<uint64_t, 64>;
   using RecordDataImpl = SmallVectorImpl<uint64_t>;
   using RecordDataRef = ArrayRef<uint64_t>;
 
 private:
+  /// LURE-local: optional kept-set restricting which Decls reach the
+  /// bitstream. nullopt = upstream behavior (no restriction). Populated
+  /// by setEmittablePreambleDecls(); cleared by releaseEmittablePreambleDecls()
+  /// at the bottom of WriteAST so the per-Writer state doesn't survive
+  /// past PCH emission.
+  std::optional<llvm::DenseSet<const Decl *>> EmittablePreambleDecls;
+
+  /// LURE-local: gate predicate read by GetDeclRef. Returns true when
+  /// either no kept set is installed (the upstream-behavior path) or the
+  /// queried Decl is in the kept set. Inline + private; the only caller
+  /// is GetDeclRef in this TU.
+  bool isEmittable(const Decl *D) const {
+    if (!EmittablePreambleDecls)
+      return true;
+    return EmittablePreambleDecls->contains(D);
+  }
+
+  /// LURE-local: release the kept set after WriteAST finishes. Mirrors
+  /// the pattern used by other one-shot writer state (e.g. clearing
+  /// DeclTypesToEmit). Returning the DenseSet's allocation to the global
+  /// allocator means a subsequent malloc_trim() can return the pages to
+  /// the OS, which is the point of bounding preamble RAM.
+  void releaseEmittablePreambleDecls() { EmittablePreambleDecls.reset(); }
+
   /// Map that provides the ID numbers of each type within the
   /// output stream, plus those deserialized from a chained PCH.
   ///

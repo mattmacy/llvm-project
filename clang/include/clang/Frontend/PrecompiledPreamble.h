@@ -15,6 +15,7 @@
 
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/Preprocessor.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MD5.h"
@@ -22,6 +23,7 @@
 #include <memory>
 #include <system_error>
 #include <type_traits>
+#include <optional>
 
 namespace llvm {
 class MemoryBuffer;
@@ -32,6 +34,9 @@ class FileSystem;
 } // namespace llvm
 
 namespace clang {
+class ASTContext;
+class Decl;
+class Sema;
 class CompilerInstance;
 class CompilerInvocation;
 class Decl;
@@ -237,6 +242,28 @@ public:
   /// Only used if FrontendOpts::SkipFunctionBodies is true.
   /// See ASTConsumer::shouldSkipFunctionBody.
   virtual bool shouldSkipFunctionBody(Decl *D) { return true; }
+
+  /// LURE-local: optionally compute the set of Decls allowed to be emitted
+  /// into the PCH. Called once, after parsing finishes, before
+  /// PCHGenerator::HandleTranslationUnit serializes anything. Default
+  /// returns std::nullopt, meaning "no restriction" (every parsed decl
+  /// becomes a candidate for emission, the upstream behavior).
+  ///
+  /// When a non-null set is returned, PrecompilePreambleConsumer installs
+  /// it on the ASTWriter via the private setEmittablePreambleDecls() hook;
+  /// ASTWriter::GetDeclRef returns an invalid LocalDeclID() for any Decl
+  /// outside the set, which propagates through the existing GetDeclRef
+  /// callers and skips emission.
+  ///
+  /// CARMACK-LOCK: rvalue return + move-publish. The kept set is moved
+  /// into ASTWriter, never copied. Caller must not pass by value.
+  ///
+  /// See clang-tools-extra/clangd/PreamblePruning.{h,cpp} +
+  /// docs/plans/2026-05-01-clangd-pch-ast-pruning.md.
+  virtual std::optional<llvm::DenseSet<const Decl *>>
+  computeEmittableDecls(ASTContext &, Sema &) {
+    return std::nullopt;
+  }
 };
 
 enum class BuildPreambleError {

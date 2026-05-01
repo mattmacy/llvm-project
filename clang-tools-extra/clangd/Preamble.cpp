@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Preamble.h"
+#include "PreamblePruning.h"
 #include "CollectMacros.h"
 #include "Compiler.h"
 #include "Config.h"
@@ -89,10 +90,23 @@ class CppFilePreambleCallbacks : public PreambleCallbacks {
 public:
   CppFilePreambleCallbacks(
       PathRef File, PreambleBuildStats *Stats, bool ParseForwardingFunctions,
+      PreambleASTPruning Pruning,
       std::function<void(CompilerInstance &)> BeforeExecuteCallback)
       : File(File), Stats(Stats),
-        ParseForwardingFunctions(ParseForwardingFunctions),
+        ParseForwardingFunctions(ParseForwardingFunctions), Pruning(Pruning),
         BeforeExecuteCallback(std::move(BeforeExecuteCallback)) {}
+
+  // LURE-local: PreambleCallbacks::computeEmittableDecls override.
+  // Commit 1: returns std::nullopt when tier=Off OR when the stub
+  // implementation in PreamblePruning.cpp returns nullopt (it always
+  // does in Commit 1). Commit 2 lands the conservative reachability
+  // pass; behavior for tier=Conservative flips at that point.
+  std::optional<llvm::DenseSet<const clang::Decl *>>
+  computeEmittableDecls(clang::ASTContext &Ctx, clang::Sema &S) override {
+    if (Pruning == PreambleASTPruning::Off)
+      return std::nullopt;
+    return clang::clangd::computeReachablePreambleDecls(Ctx, S, Pruning);
+  }
 
   IncludeStructure takeIncludes() { return std::move(Includes); }
 
@@ -224,6 +238,7 @@ private:
   const Preprocessor *PP = nullptr;
   PreambleBuildStats *Stats;
   bool ParseForwardingFunctions;
+  PreambleASTPruning Pruning;
   std::function<void(CompilerInstance &)> BeforeExecuteCallback;
   std::optional<CapturedASTCtx> CapturedCtx;
 };
@@ -647,6 +662,7 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
 
   CppFilePreambleCallbacks CapturedInfo(
       FileName, Stats, Inputs.Opts.PreambleParseForwardingFunctions,
+      Inputs.Opts.Pruning,
       [&ASTListeners](CompilerInstance &CI) {
         for (const auto &L : ASTListeners)
           L->beforeExecute(CI);

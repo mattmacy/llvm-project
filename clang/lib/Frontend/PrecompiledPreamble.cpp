@@ -305,7 +305,24 @@ public:
     return true;
   }
 
+  void InitializeSema(Sema &S) override {
+    PCHGenerator::InitializeSema(S);
+    // LURE-local: capture Sema for the computeEmittableDecls hook fired
+    // in HandleTranslationUnit. SemaPtr on the PCHGenerator base is
+    // private; we keep our own pointer rather than widen the base class.
+    PreambleSema = &S;
+  }
+
   void HandleTranslationUnit(ASTContext &Ctx) override {
+    // LURE-local: ask the callbacks for the kept set BEFORE
+    // PCHGenerator::HandleTranslationUnit runs WriteAST. The callback
+    // returns std::nullopt by default (upstream behavior); a non-null
+    // set is moved into the writer so ASTWriter::GetDeclRef can gate.
+    if (PreambleSema) {
+      auto Kept = Action.Callbacks.computeEmittableDecls(Ctx, *PreambleSema);
+      if (Kept)
+        getWriter().setEmittablePreambleDecls(std::move(*Kept));
+    }
     PCHGenerator::HandleTranslationUnit(Ctx);
     if (!hasEmittedPCH())
       return;
@@ -318,6 +335,7 @@ public:
 
 private:
   PrecompilePreambleAction &Action;
+  Sema *PreambleSema = nullptr;
 };
 
 std::unique_ptr<ASTConsumer>

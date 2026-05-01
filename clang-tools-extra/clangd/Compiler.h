@@ -16,6 +16,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANGD_COMPILER_H
 
 #include "FeatureModule.h"
+#include "PreamblePruning.h"
 #include "ModulesBuilder.h"
 #include "TidyProvider.h"
 #include "index/Index.h"
@@ -43,6 +44,11 @@ struct ParseOptions {
   bool PreambleParseForwardingFunctions = false;
 
   bool ImportInsertions = false;
+
+  // LURE-local: see clangd/tool/ClangdMain.cpp::PreambleASTPruningMode.
+  // Off => identical behavior to upstream; non-Off enables the
+  // PreamblePruning hook in PrecompilePreambleAction (Commit 2+).
+  PreambleASTPruning Pruning = PreambleASTPruning::Off;
 };
 
 /// Information required to run clang, e.g. to parse AST or do code completion.

@@ -4859,6 +4859,20 @@ time_t ASTWriter::getTimestampForOutput(const FileEntry *E) const {
   return IncludeTimestamps ? E->getModificationTime() : 0;
 }
 
+// LURE-local: install kept-set restricting which Decls reach the bitstream.
+// Single-shot; called by PrecompilePreambleConsumer::HandleTranslationUnit
+// before WriteAST runs. See ASTWriter.h doc comment for the full contract.
+//
+// CARMACK-LOCK: rvalue + move; never copy here.
+void ASTWriter::setEmittablePreambleDecls(
+    std::optional<llvm::DenseSet<const Decl *>> &&Kept) {
+  // INVARIANT: caller installs at most once per ASTWriter instance.
+  // We do not assert because some test paths construct an ASTWriter +
+  // call this twice when re-using the writer; the second install
+  // overwrites the first and that is the documented behavior.
+  EmittablePreambleDecls = std::move(Kept);
+}
+
 ASTFileSignature ASTWriter::WriteAST(Sema &SemaRef, StringRef OutputFile,
                                      Module *WritingModule, StringRef isysroot,
                                      bool ShouldCacheASTInMemory) {
@@ -4892,6 +4906,10 @@ ASTFileSignature ASTWriter::WriteAST(Sema &SemaRef, StringRef OutputFile,
                             llvm::MemoryBuffer::getMemBufferCopy(
                                 StringRef(Buffer.begin(), Buffer.size())));
   }
+  // LURE-local: release the kept set after WriteAST completes so the
+  // DenseSet allocation can be returned to the global allocator. A
+  // subsequent malloc_trim() can hand the pages back to the OS.
+  releaseEmittablePreambleDecls();
   return Signature;
 }
 
@@ -6225,6 +6243,17 @@ LocalDeclID ASTWriter::GetDeclRef(const Decl *D) {
   assert(WritingAST && "Cannot request a declaration ID before AST writing");
 
   if (!D) {
+    return LocalDeclID();
+  }
+
+  // CARMACK-LOCK: closure mechanism single source of truth.
+  //   The kept set installed via setEmittablePreambleDecls() acts as a
+  //   gate at GetDeclRef enqueue. Decls outside the set never get a
+  //   DeclID, so the existing DeclTypesToEmit drain loop
+  //   (~ASTWriter.cpp:5654-5662) does the closure as it always has;
+  //   there is no parallel walker. Out-of-set returns invalid
+  //   LocalDeclID(); existing GetDeclRef callers tolerate this.
+  if (!isEmittable(D)) {
     return LocalDeclID();
   }
 

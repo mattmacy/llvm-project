@@ -40,6 +40,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include "PreamblePruning.h"
 
 namespace clang {
 namespace clangd {
@@ -188,6 +189,13 @@ public:
     /// Whether include fixer insertions for Objective-C code should use #import
     /// instead of #include.
     bool ImportInsertions = false;
+
+    /// LURE-local: tier of preamble PCH AST pruning to apply.
+    /// Off (default) = upstream behavior. Conservative/Aggressive
+    /// enable the PreamblePruning hook in PrecompilePreambleAction
+    /// (Commit 2 onward; Commit 1 wires the option but the
+    /// reachability pass is a stub returning nullopt).
+    PreambleASTPruning Pruning = PreambleASTPruning::Off;
 
     /// Whether to collect and publish information about inactive preprocessor
     /// regions in the document.
@@ -499,6 +507,8 @@ private:
   bool PreambleParseForwardingFunctions = false;
 
   bool ImportInsertions = false;
+
+  PreambleASTPruning Pruning = PreambleASTPruning::Off;
 
   bool PublishInactiveRegions = false;
 

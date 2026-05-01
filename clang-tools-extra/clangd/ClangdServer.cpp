@@ -222,6 +222,7 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
       LineFoldingOnly(Opts.LineFoldingOnly),
       PreambleParseForwardingFunctions(Opts.PreambleParseForwardingFunctions),
       ImportInsertions(Opts.ImportInsertions),
+      Pruning(Opts.Pruning),
       PublishInactiveRegions(Opts.PublishInactiveRegions),
       WorkspaceRoot(Opts.WorkspaceRoot),
       Transient(Opts.ImplicitCancellation ? TUScheduler::InvalidateOnUpdate
@@ -299,6 +300,7 @@ void ClangdServer::addDocument(PathRef File, llvm::StringRef Contents,
   ParseOptions Opts;
   Opts.PreambleParseForwardingFunctions = PreambleParseForwardingFunctions;
   Opts.ImportInsertions = ImportInsertions;
+  Opts.Pruning = Pruning;
 
   // Compile command is set asynchronously during update, as it can be slow.
   ParseInputs Inputs;

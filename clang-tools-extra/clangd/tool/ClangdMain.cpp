@@ -18,6 +18,7 @@
 #include "Protocol.h"
 #include "TidyProvider.h"
 #include "Transport.h"
+#include "PreamblePruning.h"
 #include "index/Background.h"
 #include "index/Index.h"
 #include "index/MemIndex.h"
@@ -277,6 +278,31 @@ opt<std::string> BackgroundIndexMemoryLimit{
          "limit; the evicted file's symbols are reloaded lazily from its "
          "on-disk shard (--background-index must be on for lazy reload)."),
     init(""),
+};
+
+opt<PreambleASTPruning> PreambleASTPruningMode{
+    "preamble-ast-pruning",
+    cat(Misc),
+    desc("LURE-local: prune preamble PCH to AST decls reachable from the "
+         "TU body's name-lookup roots. Cuts preamble RAM at the cost of "
+         "preamble-build CPU. 'conservative' is query-result-equivalent to "
+         "'off' on the existing test corpus. 'aggressive' additionally "
+         "drops implicit template instantiations and macro definitions not "
+         "name-reachable from kept decls; can regress hover/signature on "
+         "highly-templated code. On UE-scale workloads, 'aggressive' is "
+         "recommended (see docs/plans/2026-05-01-clangd-pch-ast-pruning.md "
+         "section 14). Commit-1 wires the flag but the reachability pass "
+         "is a stub returning nullopt; behavior matches 'off' regardless "
+         "of tier until Commit 2 lands."),
+    values(
+        clEnumValN(PreambleASTPruning::Off, "off",
+                   "No pruning (upstream behavior)."),
+        clEnumValN(PreambleASTPruning::Conservative, "conservative",
+                   "Drop unreachable top-level decls. Keep all macros."),
+        clEnumValN(PreambleASTPruning::Aggressive, "aggressive",
+                   "Drop unreachable decls + macros + low-fanout implicit "
+                   "instantiations.")),
+    init(PreambleASTPruning::Off),
 };
 
 opt<bool> EnableClangTidy{
@@ -1086,6 +1112,7 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
   Opts.UseDirtyHeaders = UseDirtyHeaders;
   Opts.PreambleParseForwardingFunctions = PreambleParseForwardingFunctions;
   Opts.ImportInsertions = ImportInsertions;
+  Opts.Pruning = PreambleASTPruningMode;
   Opts.QueryDriverGlobs = std::move(QueryDriverGlobs);
   Opts.TweakFilter = [&](const Tweak &T) {
     if (T.hidden() && !HiddenFeatures)
