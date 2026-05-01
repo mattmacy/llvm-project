@@ -44,6 +44,7 @@
 
 namespace clang {
 namespace clangd {
+class PreambleStorage;
 /// Manages a collection of source files and derived data (ASTs, indexes),
 /// and provides language-aware features such as code completion.
 ///
@@ -113,6 +114,9 @@ public:
 
     /// This throttler controls which preambles may be built at a given time.
     clangd::PreambleThrottler *PreambleThrottler = nullptr;
+
+    /// LURE-local: process-lifetime in-memory preamble cache. Default off.
+    clangd::PreambleStorage *PreambleStorageHandle = nullptr;
 
     /// Manages to build module files.
     ModulesBuilder *ModulesManager = nullptr;

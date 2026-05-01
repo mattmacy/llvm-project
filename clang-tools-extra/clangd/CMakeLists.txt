@@ -103,6 +103,7 @@ add_clang_library(clangDaemon
   Quality.cpp
   ParsedAST.cpp
   Preamble.cpp
+  PreambleStorage.cpp
   PreamblePruning.cpp
   RIFF.cpp
   ScanningProjectModules.cpp

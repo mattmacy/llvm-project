@@ -15,6 +15,7 @@
 #include "Feature.h"
 #include "IncludeCleaner.h"
 #include "PathMapping.h"
+#include "PreambleStorage.h"
 #include "Protocol.h"
 #include "TidyProvider.h"
 #include "Transport.h"
@@ -266,6 +267,15 @@ opt<unsigned> MaxConcurrentPreambleBuilds{
          "--background-index-memory-limit, which caps the *merged* "
          "background index, not the per-worker preamble peak."),
     init(0),
+};
+
+opt<bool> ExperimentalPreambleCache{
+    "experimental-preamble-cache",
+    cat(Features),
+    desc("LURE-local: enable an in-memory preamble cache that survives across "
+         "buffer-close and reopen within a single clangd process lifetime. "
+         "Does not persist across process restart. Default off."),
+    init(false),
 };
 
 opt<std::string> BackgroundIndexMemoryLimit{
@@ -1054,6 +1064,11 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
     Throttler =
         std::make_unique<BoundedPreambleThrottler>(MaxConcurrentPreambleBuilds);
     Opts.PreambleThrottler = Throttler.get();
+  }
+  static std::unique_ptr<clangd::PreambleStorage> PreambleStorage;
+  if (ExperimentalPreambleCache) {
+    PreambleStorage = clangd::createMemoryPreambleStorage();
+    Opts.PreambleStorageHandle = PreambleStorage.get();
   }
   Opts.MemoryCleanup = getMemoryCleanupFunction();
 
