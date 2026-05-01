@@ -31,11 +31,18 @@
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/TemplateBase.h"
 #include "clang/AST/Type.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Lex/MacroInfo.h"
+#include "clang/Lex/PreprocessingRecord.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/IdentifierResolver.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <iterator>
+#include <utility>
 
 namespace clang {
 namespace clangd {
@@ -604,6 +611,152 @@ computeReachablePreambleDecls(ASTContext &Ctx, Sema &S,
   W.seed();
   W.runFixedPoint();
   return std::move(W.Kept);
+}
+
+namespace {
+
+// CARMACK-LOCK: aggressive macro filter index strategy (v4).
+//   Per-FileID sorted interval tables over kept-Decl SourceRange
+//   (file-offset form). Range-overlap queries used per macro-
+//   expansion site. Plan §3.3.3.C.
+//
+// NOTE: Indexed across ALL FileIDs that kept Decls occupy, not only
+//   the preamble's main FileID. A "preamble" in clangd routinely
+//   spans implicitly-included headers (and TestTU's HeaderCode is a
+//   separate file pulled in via -include), so kept Decls and macro
+//   expansion sites legitimately live in non-main FileIDs. The
+//   filter must compare by FileID identity, not against a single
+//   "the preamble FileID" value. (Was the cause of
+//   AggressiveKeepsMacroExpandedInsideKeptDecl /
+//   AggressiveBodyRedefineDoesNotCrash false-negatives.)
+struct KeptDeclIntervalIndex {
+  struct Interval {
+    unsigned Begin;
+    unsigned End;
+  };
+  llvm::DenseMap<FileID, llvm::SmallVector<Interval, 8>> ByFile;
+
+  void build(const llvm::DenseSet<const Decl *> &KeptDecls,
+             const SourceManager &SM) {
+    ByFile.clear();
+    for (const Decl *D : KeptDecls) {
+      SourceRange R = D->getSourceRange();
+      if (R.isInvalid())
+        continue;
+      auto BeginPair = SM.getDecomposedExpansionLoc(R.getBegin());
+      auto EndPair = SM.getDecomposedExpansionLoc(R.getEnd());
+      // Only index ranges where Begin and End live in the same
+      // FileID; mixed-FileID ranges (rare; #include spliced ranges)
+      // are skipped defensively.
+      if (BeginPair.first != EndPair.first)
+        continue;
+      if (BeginPair.first.isInvalid())
+        continue;
+      if (EndPair.second < BeginPair.second)
+        continue; // defensive; should not happen
+      ByFile[BeginPair.first].push_back(
+          {BeginPair.second, EndPair.second});
+    }
+    for (auto &Entry : ByFile) {
+      llvm::sort(Entry.second.begin(), Entry.second.end(),
+                 [](const Interval &A, const Interval &B) {
+                   return A.Begin < B.Begin;
+                 });
+    }
+  }
+
+  bool overlaps(FileID FID, unsigned BeginOff, unsigned EndOff) const {
+    auto It = ByFile.find(FID);
+    if (It == ByFile.end())
+      return false;
+    const auto &Intervals = It->second;
+    if (BeginOff > EndOff)
+      std::swap(BeginOff, EndOff);
+    auto UB = std::upper_bound(
+        Intervals.begin(), Intervals.end(), BeginOff,
+        [](unsigned V, const Interval &I) { return V < I.Begin; });
+    if (UB != Intervals.begin()) {
+      auto Prev = std::prev(UB);
+      if (Prev->End >= BeginOff)
+        return true;
+    }
+    for (; UB != Intervals.end() && UB->Begin <= EndOff; ++UB) {
+      if (UB->End >= BeginOff)
+        return true;
+    }
+    return false;
+  }
+};
+
+} // namespace
+
+// INVARIANT: When Tier != Aggressive, returns nullopt. Off and
+//   Conservative keep all macros (plan §3.3.3 v4).
+// INVARIANT: When PP.getPreprocessingRecord() is nullptr, returns
+//   nullopt with a logged warning. Aggressive-tier wiring failure
+//   degrades to conservative-macro behavior, never crashes.
+// INVARIANT: Returned set is monotone -- every MacroDirective whose
+//   IdentifierInfo's expansion was observed inside a kept-Decl range
+//   is included; no MacroDirective NOT meeting that criterion is
+//   included.
+// SAFETY: Runs on the PreambleThread, holds no locks, calls back into
+//   neither TUScheduler nor CppFile. Concurrency: none. (Plan §15.3.)
+std::optional<llvm::DenseSet<const MacroDirective *>>
+computeReachablePreambleMacros(
+    ASTContext &Ctx, Sema & /*S*/, Preprocessor &PP,
+    const llvm::DenseSet<const Decl *> &KeptDecls,
+    PreambleASTPruning Tier) {
+  if (Tier != PreambleASTPruning::Aggressive)
+    return std::nullopt;
+
+  PreprocessingRecord *PR = PP.getPreprocessingRecord();
+  if (!PR) {
+    llvm::errs()
+        << "clangd PCH-AST-pruning aggressive: PreprocessingRecord is null "
+           "on the preamble Preprocessor; PreprocessorOpts::DetailedRecord "
+           "likely was not set on the CompilerInvocation in time. Falling "
+           "back to conservative macro behavior (returning nullopt).\n";
+    return std::nullopt;
+  }
+
+  const SourceManager &SM = Ctx.getSourceManager();
+
+  KeptDeclIntervalIndex Idx;
+  Idx.build(KeptDecls, SM);
+
+  llvm::DenseSet<const IdentifierInfo *> KeptMacroNames;
+  for (auto It = PR->begin(); It != PR->end(); ++It) {
+    PreprocessedEntity *E = *It;
+    auto *ME = llvm::dyn_cast<MacroExpansion>(E);
+    if (!ME)
+      continue;
+    SourceRange R = ME->getSourceRange();
+    if (R.isInvalid())
+      continue;
+    auto BeginPair = SM.getDecomposedExpansionLoc(R.getBegin());
+    auto EndPair = SM.getDecomposedExpansionLoc(R.getEnd());
+    // Macro expansion site must live within a single FileID; mixed-
+    // FileID expansions (rare) are skipped defensively.
+    if (BeginPair.first != EndPair.first || BeginPair.first.isInvalid())
+      continue;
+    if (!Idx.overlaps(BeginPair.first, BeginPair.second, EndPair.second))
+      continue;
+    if (const IdentifierInfo *II = ME->getName())
+      KeptMacroNames.insert(II);
+  }
+
+  llvm::DenseSet<const MacroDirective *> Kept;
+  for (const auto &MM : PP.macros()) {
+    const IdentifierInfo *II = MM.first;
+    if (!KeptMacroNames.contains(II))
+      continue;
+    MacroDirective *MD = PP.getLocalMacroDirectiveHistory(II);
+    while (MD) {
+      Kept.insert(MD);
+      MD = MD->getPrevious();
+    }
+  }
+  return Kept;
 }
 
 } // namespace clangd

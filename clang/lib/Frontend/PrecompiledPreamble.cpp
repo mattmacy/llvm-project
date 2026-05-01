@@ -320,8 +320,21 @@ public:
     // set is moved into the writer so ASTWriter::GetDeclRef can gate.
     if (PreambleSema) {
       auto Kept = Action.Callbacks.computeEmittableDecls(Ctx, *PreambleSema);
-      if (Kept)
+      if (Kept) {
+        // LURE-local C3: snapshot the kept-Decl set by const-ref BEFORE
+        // the move so the macro hook can borrow it for SourceRange
+        // indexing. Cheap (DenseSet copy of pointer-sized entries);
+        // alternative would be re-running the reachability walk.
+        const llvm::DenseSet<const Decl *> KeptCopy = *Kept;
         getWriter().setEmittablePreambleDecls(std::move(*Kept));
+        // LURE-local C3: aggressive-tier macro filter (plan §3.3.3).
+        // Default override returns nullopt (conservative + off tiers).
+        Preprocessor &PP = PreambleSema->getPreprocessor();
+        auto KeptMacros = Action.Callbacks.computeEmittableMacros(
+            Ctx, *PreambleSema, PP, KeptCopy);
+        if (KeptMacros)
+          getWriter().setEmittablePreambleMacros(std::move(*KeptMacros));
+      }
     }
     PCHGenerator::HandleTranslationUnit(Ctx);
     if (!hasEmittedPCH())

@@ -58,6 +58,7 @@ class HeaderSearch;
 class HeaderSearchOptions;
 class IdentifierResolver;
 class LangOptions;
+class MacroDirective;
 class MacroDefinitionRecord;
 class MacroInfo;
 class Module;
@@ -108,6 +109,17 @@ public:
   void setEmittablePreambleDecls(
       std::optional<llvm::DenseSet<const Decl *>> &&Kept);
 
+  /// LURE-local C3: install the kept-macro set restricting which
+  /// preamble macros reach the PCH. Single-shot; MUST be called BEFORE
+  /// WriteAST runs (PrecompilePreambleConsumer::HandleTranslationUnit
+  /// is the canonical caller). MacroDirectives outside the set are
+  /// skipped during WritePreprocessor's per-directive emission loop.
+  ///
+  /// CARMACK-LOCK: rvalue + move; never pass by value at the call site.
+  /// Mirrors setEmittablePreambleDecls semantics one-for-one.
+  void setEmittablePreambleMacros(
+      std::optional<llvm::DenseSet<const MacroDirective *>> &&Kept);
+
   using RecordData = SmallVector<uint64_t, 64>;
   using RecordDataImpl = SmallVectorImpl<uint64_t>;
   using RecordDataRef = ArrayRef<uint64_t>;
@@ -120,6 +132,12 @@ private:
   /// past PCH emission.
   std::optional<llvm::DenseSet<const Decl *>> EmittablePreambleDecls;
 
+  /// LURE-local C3: optional kept-MacroDirective set restricting
+  /// preamble macro emission. nullopt = upstream behavior. Cleared
+  /// alongside the Decl set by releaseEmittablePreambleDecls().
+  std::optional<llvm::DenseSet<const MacroDirective *>>
+      EmittablePreambleMacros;
+
   /// LURE-local: gate predicate read by GetDeclRef. Returns true when
   /// either no kept set is installed (the upstream-behavior path) or the
   /// queried Decl is in the kept set. Inline + private; the only caller
@@ -130,12 +148,25 @@ private:
     return EmittablePreambleDecls->contains(D);
   }
 
+  /// LURE-local C3: gate predicate read by WritePreprocessor's
+  /// per-MacroDirective loop. Returns true when no kept set is
+  /// installed (upstream-behavior path) or the queried directive is
+  /// in the kept set.
+  bool isEmittableMacro(const MacroDirective *MD) const {
+    if (!EmittablePreambleMacros)
+      return true;
+    return EmittablePreambleMacros->contains(MD);
+  }
+
   /// LURE-local: release the kept set after WriteAST finishes. Mirrors
   /// the pattern used by other one-shot writer state (e.g. clearing
   /// DeclTypesToEmit). Returning the DenseSet's allocation to the global
   /// allocator means a subsequent malloc_trim() can return the pages to
   /// the OS, which is the point of bounding preamble RAM.
-  void releaseEmittablePreambleDecls() { EmittablePreambleDecls.reset(); }
+  void releaseEmittablePreambleDecls() {
+    EmittablePreambleDecls.reset();
+    EmittablePreambleMacros.reset();
+  }
 
   /// Map that provides the ID numbers of each type within the
   /// output stream, plus those deserialized from a chained PCH.

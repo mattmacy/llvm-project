@@ -14,14 +14,19 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Preamble.h"
 #include "PreamblePruning.h"
 #include "TestTU.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Type.h"
+#include "clang/Lex/Preprocessor.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringMap.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include <cassert>
 
 namespace clang {
 namespace clangd {
@@ -83,6 +88,60 @@ llvm::DenseSet<const Decl *> runConservative(llvm::StringRef HeaderCode,
                                             PreambleASTPruning::Conservative);
   EXPECT_TRUE(ROpt.has_value());
   return ROpt ? std::move(*ROpt) : llvm::DenseSet<const Decl *>();
+}
+
+struct CapturedKeptSets {
+  std::optional<llvm::DenseSet<const clang::Decl *>> KeptDecls;
+  std::optional<llvm::DenseSet<const clang::MacroDirective *>> KeptMacros;
+  std::optional<PreambleASTPruning> PreambleDataPruning;
+  llvm::StringMap<bool> KeptByName;
+
+  bool IdentifierKept(llvm::StringRef Name) const {
+    auto It = KeptByName.find(Name);
+    return It != KeptByName.end() && It->second;
+  }
+};
+
+CapturedKeptSets buildPreambleAndCaptureMacros(TestTU &TU,
+                                               PreambleASTPruning Tier) {
+  CapturedKeptSets Out;
+  MockFS FS;
+  auto Inputs = TU.inputs(FS);
+  Inputs.Opts.Pruning = Tier;
+  IgnoreDiagnostics Diags;
+  auto CI = buildCompilerInvocation(Inputs, Diags);
+  assert(CI && "Failed to build compiler invocation.");
+  PreambleBuildCaptureHooks Hooks;
+  Hooks.OnKeptDecls = [&](const llvm::DenseSet<const Decl *> &KeptDecls) {
+    Out.KeptDecls = KeptDecls;
+  };
+  Hooks.OnKeptMacros =
+      [&](const llvm::DenseSet<const MacroDirective *> &KeptMacros,
+          Preprocessor &PP) {
+        Out.KeptMacros = KeptMacros;
+        for (const auto &MM : PP.macros()) {
+          const IdentifierInfo *II = MM.first;
+          MacroDirective *MD = PP.getLocalMacroDirectiveHistory(II);
+          bool AnyKept = false;
+          while (MD) {
+            if (KeptMacros.contains(MD)) {
+              AnyKept = true;
+              break;
+            }
+            MD = MD->getPrevious();
+          }
+          Out.KeptByName[II->getName()] = AnyKept;
+        }
+      };
+  setPreambleBuildCaptureHooksForTest(&Hooks);
+  auto ResetHooks = llvm::make_scope_exit(
+      [] { setPreambleBuildCaptureHooksForTest(nullptr); });
+  auto Preamble = buildPreamble(testPath(TU.Filename), *CI, Inputs,
+                                /*StoreInMemory=*/true,
+                                /*PreambleCallback=*/nullptr);
+  if (Preamble)
+    Out.PreambleDataPruning = Preamble->Pruning;
+  return Out;
 }
 
 TEST(PreamblePruningTest, KeepsBodyReachableDecls) {
@@ -220,6 +279,77 @@ TEST(PreamblePruningTest, ConservativeKeepsADLBegin) {
                               "N::S s;");
   EXPECT_TRUE(containsDeclNamed(Kept, "begin"));
   EXPECT_TRUE(containsDeclNamed(Kept, "end"));
+}
+
+TEST(PreamblePruningTest, AggressiveKeepsMacroExpandedInsideKeptDecl) {
+  TestTU TU;
+  TU.HeaderCode = R"cpp(
+    #define USED 42
+    #define UNUSED 7
+    struct Reachable { int v = USED; };
+  )cpp";
+  TU.Code = R"cpp(
+    Reachable r;
+  )cpp";
+  auto Captured =
+      buildPreambleAndCaptureMacros(TU, PreambleASTPruning::Aggressive);
+  ASSERT_TRUE(Captured.KeptMacros.has_value());
+  EXPECT_TRUE(Captured.IdentifierKept("USED"));
+  EXPECT_FALSE(Captured.IdentifierKept("UNUSED"));
+}
+
+TEST(PreamblePruningTest, AggressiveDropsMacroDefinedButNotExpanded) {
+  TestTU TU;
+  TU.HeaderCode = R"cpp(
+    #define DEFINED_NEVER_USED 1
+    int g = 0;
+  )cpp";
+  TU.Code = R"cpp( int x = g; )cpp";
+  auto Captured =
+      buildPreambleAndCaptureMacros(TU, PreambleASTPruning::Aggressive);
+  ASSERT_TRUE(Captured.KeptMacros.has_value());
+  EXPECT_FALSE(Captured.IdentifierKept("DEFINED_NEVER_USED"));
+}
+
+TEST(PreamblePruningTest, AggressiveBodyRedefineDoesNotCrash) {
+  TestTU TU;
+  TU.HeaderCode = R"cpp(
+    #define X 1
+    int header_x = X;
+  )cpp";
+  TU.Code = R"cpp(
+    #undef X
+    #define X 99
+    int body_x = X;
+  )cpp";
+  auto Captured =
+      buildPreambleAndCaptureMacros(TU, PreambleASTPruning::Aggressive);
+  ASSERT_TRUE(Captured.KeptMacros.has_value());
+  EXPECT_TRUE(Captured.IdentifierKept("X"));
+}
+
+TEST(PreamblePruningTest, AggressivePreambleDataPruningPlumbed) {
+  TestTU TU;
+  TU.HeaderCode = "struct S { int x; };";
+  TU.Code = "S s;";
+  auto Captured =
+      buildPreambleAndCaptureMacros(TU, PreambleASTPruning::Aggressive);
+  ASSERT_TRUE(Captured.PreambleDataPruning.has_value());
+  EXPECT_EQ(*Captured.PreambleDataPruning, PreambleASTPruning::Aggressive);
+}
+
+TEST(PreamblePruningTest, ConservativeMacroPathReturnsNullopt) {
+  TestTU TU;
+  TU.HeaderCode = R"cpp(
+    struct Reached { int x; };
+  )cpp";
+  TU.Code = R"cpp(
+    Reached r;
+  )cpp";
+  auto Captured =
+      buildPreambleAndCaptureMacros(TU, PreambleASTPruning::Conservative);
+  EXPECT_TRUE(Captured.KeptDecls.has_value());
+  EXPECT_FALSE(Captured.KeptMacros.has_value());
 }
 
 } // namespace
