@@ -2579,7 +2579,8 @@ void ASTWriter::WritePreprocessor(const Preprocessor &PP, bool IsModule) {
       // We preserve the final state of defined macros, and we do not emit ones
       // that are undefined.
       if (!MD || shouldIgnoreMacro(MD, IsModule, PP) ||
-          MD->getKind() == MacroDirective::MD_Undefine)
+          MD->getKind() == MacroDirective::MD_Undefine ||
+          !isEmittableMacro(MD))
         continue;
       AddSourceLocation(MD->getLocation(), Record);
       Record.push_back(MD->getKind());
@@ -2596,6 +2597,18 @@ void ASTWriter::WritePreprocessor(const Preprocessor &PP, bool IsModule) {
     } else {
       // Emit the macro directives in reverse source order.
       for (; MD; MD = MD->getPrevious()) {
+        // LURE-local C3: aggressive-tier macro filter. When an
+        // EmittablePreambleMacros set is installed, MacroDirectives
+        // not in the set are skipped (continue, not break -- the rest of
+        // the chain may still contain emittable directives). When no set
+        // is installed, isEmittableMacro returns true unconditionally
+        // and the loop runs upstream-style.
+        // INVARIANT: When EmittablePreambleMacros is nullopt, every
+        // MacroDirective is emitted (upstream behavior).
+        // INVARIANT: continue, not break. MD->getPrevious() may be
+        // emittable even when MD is not.
+        if (!isEmittableMacro(MD))
+          continue;
         // Once we hit an ignored macro, we're done: the rest of the chain
         // will all be ignored macros.
         if (shouldIgnoreMacro(MD, IsModule, PP))
@@ -4871,6 +4884,14 @@ void ASTWriter::setEmittablePreambleDecls(
   // call this twice when re-using the writer; the second install
   // overwrites the first and that is the documented behavior.
   EmittablePreambleDecls = std::move(Kept);
+}
+
+// LURE-local C3: install kept-MacroDirective set restricting preamble
+// macro emission. Mirrors setEmittablePreambleDecls one-shot semantics.
+// CARMACK-LOCK: rvalue + move; never copy here.
+void ASTWriter::setEmittablePreambleMacros(
+    std::optional<llvm::DenseSet<const MacroDirective *>> &&Kept) {
+  EmittablePreambleMacros = std::move(Kept);
 }
 
 ASTFileSignature ASTWriter::WriteAST(Sema &SemaRef, StringRef OutputFile,

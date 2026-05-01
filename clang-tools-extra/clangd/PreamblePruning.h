@@ -33,6 +33,8 @@
 namespace clang {
 class ASTContext;
 class Decl;
+class MacroDirective;
+class Preprocessor;
 class Sema;
 namespace clangd {
 
@@ -80,6 +82,36 @@ llvm::StringRef toCanonicalString(PreambleASTPruning);
 std::optional<llvm::DenseSet<const Decl *>>
 computeReachablePreambleDecls(ASTContext &Ctx, Sema &S,
                               PreambleASTPruning Tier);
+
+/// Plan §3.3.3 (v4) aggressive tier: compute the set of
+/// MacroDirectives allowed to land in the PCH. Returns nullopt when
+/// Tier != Aggressive (Off and Conservative keep all macros).
+///
+/// When non-nullopt, the returned set contains every MacroDirective
+/// whose IdentifierInfo names a macro whose expansion site lies inside
+/// a kept-Decl SourceRange. The expansion-site lookup reads the
+/// PreprocessingRecord on the Preprocessor; the caller (Preamble.cpp
+/// buildPreamble) is responsible for setting
+/// PreprocessorOpts::DetailedRecord = true on the CompilerInvocation
+/// when Tier == Aggressive -- see plan §3.3.3.B.
+///
+/// If PP.getPreprocessingRecord() returns nullptr (the
+/// CompilerInvocation flag was not set, or the preprocessor was
+/// constructed before the flag took effect), this function logs a
+/// warning and returns std::nullopt -- degrading aggressive-tier
+/// macro filter to conservative behavior for macros only.
+///
+/// CARMACK-LOCK: aggressive macro filter index strategy (v4).
+///   Naive O(macros × kept-decls) = O(10^9) on UE preambles. Index
+///   kept-Decl SourceRange begins as a sorted interval table; each
+///   macro-expansion SourceRange is a range-overlap query -- O(log N
+///   + k) for k overlapping intervals. Total cost ~1.7e6 ops on
+///   UE-scale preambles + 8 MB transient RAM during preamble build.
+std::optional<llvm::DenseSet<const clang::MacroDirective *>>
+computeReachablePreambleMacros(
+    clang::ASTContext &Ctx, clang::Sema &S, clang::Preprocessor &PP,
+    const llvm::DenseSet<const clang::Decl *> &KeptDecls,
+    PreambleASTPruning Tier);
 
 } // namespace clangd
 } // namespace clang

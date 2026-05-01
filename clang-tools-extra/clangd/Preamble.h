@@ -37,6 +37,7 @@
 #include "clang/Frontend/PrecompiledPreamble.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -126,7 +127,25 @@ struct PreambleData {
   // Whether there was a (possibly-incomplete) include-guard on the main file.
   // We need to propagate this information "by hand" to subsequent parses.
   bool MainIsIncludeGuarded = false;
+  // LURE-local C3: which Pruning tier built this preamble. Read by
+  // PreamblePatch::create to enforce plan §8.5 -- aggressive-tier
+  // preambles drop macros not name-reachable from kept Decls, so
+  // PreamblePatch's MacroDirective replay is unsafe (replaying a
+  // #undef of a dropped macro produces wrong state). Default Off
+  // means "upstream-style build, full PreamblePatch reuse permitted".
+  PreambleASTPruning Pruning = PreambleASTPruning::Off;
 };
+
+/// LURE-local C3: narrow unit-test hook for observing aggressive-tier
+/// kept sets during the real preamble-build window.
+struct PreambleBuildCaptureHooks {
+  std::function<void(const llvm::DenseSet<const Decl *> &)> OnKeptDecls;
+  std::function<void(const llvm::DenseSet<const MacroDirective *> &,
+                     Preprocessor &)>
+      OnKeptMacros;
+};
+
+void setPreambleBuildCaptureHooksForTest(PreambleBuildCaptureHooks *Hooks);
 
 using PreambleParsedCallback =
     std::function<void(CapturedASTCtx ASTCtx,

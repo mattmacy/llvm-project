@@ -81,6 +81,8 @@ namespace clang {
 namespace clangd {
 namespace {
 
+thread_local PreambleBuildCaptureHooks *CaptureHooksForTest = nullptr;
+
 bool compileCommandsAreEqual(const tooling::CompileCommand &LHS,
                              const tooling::CompileCommand &RHS) {
   // We don't check for Output, it should not matter to clangd.
@@ -129,7 +131,27 @@ public:
   computeEmittableDecls(clang::ASTContext &Ctx, clang::Sema &S) override {
     if (Pruning == PreambleASTPruning::Off)
       return std::nullopt;
-    return clang::clangd::computeReachablePreambleDecls(Ctx, S, Pruning);
+    auto Kept = clang::clangd::computeReachablePreambleDecls(Ctx, S, Pruning);
+    if (CaptureHooksForTest && Kept && CaptureHooksForTest->OnKeptDecls)
+      CaptureHooksForTest->OnKeptDecls(*Kept);
+    return Kept;
+  }
+
+  // LURE-local C3: aggressive-tier macro filter override (plan
+  // §3.3.3 v4). Returns nullopt for Off + Conservative tiers,
+  // the v4 PreprocessingRecord-based kept set for Aggressive.
+  std::optional<llvm::DenseSet<const clang::MacroDirective *>>
+  computeEmittableMacros(
+      clang::ASTContext &Ctx, clang::Sema &S, clang::Preprocessor &PP,
+      const llvm::DenseSet<const clang::Decl *> &KeptDecls) override {
+    if (Pruning != PreambleASTPruning::Aggressive)
+      return std::nullopt;
+    auto Kept = clang::clangd::computeReachablePreambleMacros(Ctx, S, PP,
+                                                              KeptDecls,
+                                                              Pruning);
+    if (CaptureHooksForTest && Kept && CaptureHooksForTest->OnKeptMacros)
+      CaptureHooksForTest->OnKeptMacros(*Kept, PP);
+    return Kept;
   }
 
   IncludeStructure takeIncludes() { return std::move(Includes); }
@@ -698,6 +720,14 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
   // We don't want to write comment locations into PCH. They are racy and slow
   // to read back. We rely on dynamic index for the comments instead.
   CI.getPreprocessorOpts().WriteCommentListToPCH = false;
+  // LURE-local C3 (plan §3.3.3.B): aggressive tier needs the
+  // preprocessor's PreprocessingRecord populated so the macro filter
+  // (computeReachablePreambleMacros) can read MacroExpansion entries.
+  // Cost: ~8 MB transient RAM during the preamble build window.
+  // Conservative + Off tiers leave the flag at its default (false)
+  // because they keep all macros and don't need the record.
+  if (Inputs.Opts.Pruning == PreambleASTPruning::Aggressive)
+    CI.getPreprocessorOpts().DetailedRecord = true;
 
   CppFilePreambleCallbacks CapturedInfo(
       FileName, Stats, Inputs.Opts.PreambleParseForwardingFunctions,
@@ -770,6 +800,9 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
     Result->StatCache = StatCache;
     Result->MainIsIncludeGuarded = CapturedInfo.isMainFileIncludeGuarded();
     Result->TargetOpts = CI.TargetOpts;
+    // LURE-local C3: stamp the tier on the result so
+    // PreamblePatch::create can read it (plan §8.5).
+    Result->Pruning = Inputs.Opts.Pruning;
     if (PreambleCallback) {
       trace::Span Tracer("Running PreambleCallback");
       auto Ctx = CapturedInfo.takeLife();
@@ -860,6 +893,17 @@ PreamblePatch PreamblePatch::create(llvm::StringRef FileName,
   trace::Span Tracer("CreatePreamblePatch");
   SPAN_ATTACH(Tracer, "File", FileName);
   assert(llvm::sys::path::is_absolute(FileName) && "relative FileName!");
+  // LURE-local C3 (plan §8.5): aggressive-tier preambles drop
+  // MacroDirectives not name-reachable from kept Decls.
+  // PreamblePatch replays MacroDirective history when patching a
+  // stale preamble against an edited body; replaying a #undef of a
+  // dropped macro produces wrong state. Force full preamble rebuild
+  // on every body edit when the source preamble was built with
+  // Pruning == Aggressive. This trades wall-time-on-edit for
+  // hover/completion correctness -- the documented aggressive-tier
+  // tradeoff.
+  if (Baseline.Pruning == PreambleASTPruning::Aggressive)
+    return PreamblePatch::unmodified(Baseline);
   // First scan preprocessor directives in Baseline and Modified. These will be
   // used to figure out newly added directives in Modified. Scanning can fail,
   // the code just bails out and creates an empty patch in such cases, as:
@@ -1041,6 +1085,10 @@ OptionalFileEntryRef PreamblePatch::getPatchEntry(llvm::StringRef MainFilePath,
                                                   const SourceManager &SM) {
   auto PatchFilePath = getPatchName(MainFilePath);
   return SM.getFileManager().getOptionalFileRef(PatchFilePath);
+}
+
+void setPreambleBuildCaptureHooksForTest(PreambleBuildCaptureHooks *Hooks) {
+  CaptureHooksForTest = Hooks;
 }
 } // namespace clangd
 } // namespace clang

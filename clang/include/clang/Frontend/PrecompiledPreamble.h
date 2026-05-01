@@ -36,6 +36,8 @@ class FileSystem;
 namespace clang {
 class ASTContext;
 class Decl;
+class MacroDirective;
+class Preprocessor;
 class Sema;
 class CompilerInstance;
 class CompilerInvocation;
@@ -262,6 +264,25 @@ public:
   /// docs/plans/2026-05-01-clangd-pch-ast-pruning.md.
   virtual std::optional<llvm::DenseSet<const Decl *>>
   computeEmittableDecls(ASTContext &, Sema &) {
+    return std::nullopt;
+  }
+
+  /// LURE-local C3: optionally compute the set of MacroDirectives
+  /// allowed to land in the PCH. Called once, after parsing finishes,
+  /// after computeEmittableDecls, before
+  /// PCHGenerator::HandleTranslationUnit serializes anything. Default
+  /// returns std::nullopt (no restriction; upstream behavior).
+  /// Aggressive-tier clangd preambles override this.
+  ///
+  /// The KeptDecls parameter is a const-ref to the set just returned
+  /// by computeEmittableDecls (snapshotted by the caller before move-
+  /// publishing into the writer); the macro filter uses the kept-Decl
+  /// SourceRanges to build an interval index. Plan §3.3.3 (v4).
+  ///
+  /// CARMACK-LOCK: rvalue return + move-publish; never pass by value.
+  virtual std::optional<llvm::DenseSet<const MacroDirective *>>
+  computeEmittableMacros(ASTContext &, Sema &, Preprocessor &,
+                         const llvm::DenseSet<const Decl *> &) {
     return std::nullopt;
   }
 };
