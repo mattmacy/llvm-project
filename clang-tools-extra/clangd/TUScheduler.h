@@ -29,6 +29,7 @@ namespace clang {
 namespace clangd {
 class ParsedAST;
 struct PreambleData;
+class PreambleStorage;
 
 /// Returns a number of a default async threads to use for TUScheduler.
 /// Returned value is always >= 1 (i.e. will not cause requests to be processed
@@ -231,6 +232,9 @@ public:
 
     /// This throttler controls which preambles may be built at a given time.
     clangd::PreambleThrottler *PreambleThrottler = nullptr;
+
+    /// LURE-local: process-lifetime in-memory preamble cache. Null disables.
+    clangd::PreambleStorage *PreambleStorageHandle = nullptr;
 
     /// Used to create a context that wraps each single operation.
     /// Typically to inject per-file configuration.

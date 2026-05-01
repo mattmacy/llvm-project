@@ -49,6 +49,7 @@
 
 namespace clang {
 namespace clangd {
+class PreambleStorage;
 
 /// The captured AST context.
 /// Keeps necessary structs for an ASTContext and Preprocessor alive.
@@ -157,7 +158,8 @@ std::shared_ptr<const PreambleData>
 buildPreamble(PathRef FileName, CompilerInvocation CI,
               const ParseInputs &Inputs, bool StoreInMemory,
               PreambleParsedCallback PreambleCallback,
-              PreambleBuildStats *Stats = nullptr);
+              PreambleBuildStats *Stats = nullptr,
+              PreambleStorage *Storage = nullptr);
 
 /// Returns true if \p Preamble is reusable for \p Inputs. Note that it will
 /// return true when some missing headers are now available.

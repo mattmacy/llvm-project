@@ -8,6 +8,7 @@
 
 #include "Preamble.h"
 #include "PreamblePruning.h"
+#include "PreambleStorage.h"
 #include "CollectMacros.h"
 #include "Compiler.h"
 #include "Config.h"
@@ -29,6 +30,7 @@
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceLocation.h"
+#include "clang/Basic/Version.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/TokenKinds.h"
@@ -84,6 +86,28 @@ bool compileCommandsAreEqual(const tooling::CompileCommand &LHS,
   // We don't check for Output, it should not matter to clangd.
   return LHS.Directory == RHS.Directory && LHS.Filename == RHS.Filename &&
          llvm::ArrayRef(LHS.CommandLine).equals(RHS.CommandLine);
+}
+
+llvm::StringRef getABITag() {
+  // Use clang::getClangFullVersion() instead of __clang_version__ macro:
+  // the macro is a clang-only predefined and is undefined when clangd is
+  // built with gcc. The API call is host-compiler-agnostic and is what
+  // clang-tooling code uses elsewhere (e.g. Sarif.h).
+  static const std::string Tag = clang::getClangFullVersion();
+  return Tag;
+}
+
+// PLAN §10: LURETag composition includes pruning, codec, dict, and fmt.
+// Worked example: preamble-cache-v1:pruning=off:codec=0:dict=0:fmt=1.
+std::string computeLURETag(const ParseOptions &Opts) {
+  llvm::SmallString<128> S;
+  llvm::raw_svector_ostream OS(S);
+  OS << "preamble-cache-v1"
+     << ":pruning=" << toCanonicalString(Opts.Pruning)
+     << ":codec=0"
+     << ":dict=0"
+     << ":fmt=1";
+  return std::string(OS.str());
 }
 
 class CppFilePreambleCallbacks : public PreambleCallbacks {
@@ -606,12 +630,27 @@ std::shared_ptr<const PreambleData>
 buildPreamble(PathRef FileName, CompilerInvocation CI,
               const ParseInputs &Inputs, bool StoreInMemory,
               PreambleParsedCallback PreambleCallback,
-              PreambleBuildStats *Stats) {
+              PreambleBuildStats *Stats, PreambleStorage *Storage) {
   // Note that we don't need to copy the input contents, preamble can live
   // without those.
   auto ContentsBuffer =
       llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
   auto Bounds = ComputePreambleBounds(CI.getLangOpts(), *ContentsBuffer, 0);
+  PreambleKey CacheKey;
+  const bool CacheActive = Storage != nullptr;
+  if (CacheActive) {
+    std::string LURETag = computeLURETag(Inputs.Opts);
+    PreambleKeyInputs KeyInputs;
+    KeyInputs.AbsoluteTUPath = FileName;
+    KeyInputs.CompileCommandArgv = Inputs.CompileCommand.CommandLine;
+    KeyInputs.ABITag = getABITag();
+    KeyInputs.LURETag = LURETag;
+    CacheKey = PreambleKey::compute(KeyInputs);
+    if (auto Cached = Storage->loadIfFresh(CacheKey)) {
+      log("Preamble cache hit for {0} (key {1})", FileName, CacheKey.Digest);
+      return Cached;
+    }
+  }
 
   trace::Span Tracer("BuildPreamble");
   SPAN_ATTACH(Tracer, "File", FileName);
@@ -743,6 +782,10 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
       Ctx->setStatCache(Result->StatCache);
 
       PreambleCallback(std::move(*Ctx), Result->Pragmas);
+    }
+    if (CacheActive) {
+      Storage->store(CacheKey, Result);
+      log("Preamble cache stored {0} (key {1})", FileName, CacheKey.Digest);
     }
     return Result;
   }

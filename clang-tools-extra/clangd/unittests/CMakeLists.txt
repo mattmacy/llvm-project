@@ -80,6 +80,7 @@ add_unittest(ClangdUnitTests ClangdTests
   PathMappingTests.cpp
   PreambleTests.cpp
   PreamblePruningTests.cpp
+  PreambleStorageTests.cpp
   PrintASTTests.cpp
   ProjectAwareIndexTests.cpp
   QualityTests.cpp

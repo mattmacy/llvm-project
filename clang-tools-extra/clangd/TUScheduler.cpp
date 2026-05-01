@@ -54,6 +54,7 @@
 #include "GlobalCompilationDatabase.h"
 #include "ParsedAST.h"
 #include "Preamble.h"
+#include "PreambleStorage.h"
 #include "clang-include-cleaner/Record.h"
 #include "support/Cancellation.h"
 #include "support/Context.h"
@@ -428,11 +429,11 @@ public:
                  bool StorePreambleInMemory, bool RunSync,
                  PreambleThrottler *Throttler, SynchronizedTUStatus &Status,
                  TUScheduler::HeaderIncluderCache &HeaderIncluders,
-                 ASTWorker &AW)
+                 ASTWorker &AW, PreambleStorage *Storage = nullptr)
       : FileName(FileName), Callbacks(Callbacks),
         StoreInMemory(StorePreambleInMemory), RunSync(RunSync),
         Throttler(Throttler), Status(Status), ASTPeer(AW),
-        HeaderIncluders(HeaderIncluders) {}
+        HeaderIncluders(HeaderIncluders), Storage(Storage) {}
 
   /// It isn't guaranteed that each requested version will be built. If there
   /// are multiple update requests while building a preamble, only the last one
@@ -586,6 +587,7 @@ private:
   SynchronizedTUStatus &Status;
   ASTWorker &ASTPeer;
   TUScheduler::HeaderIncluderCache &HeaderIncluders;
+  PreambleStorage *Storage;
 };
 
 class ASTWorkerHandle;
@@ -838,7 +840,8 @@ ASTWorker::ASTWorker(PathRef FileName, const GlobalCompilationDatabase &CDB,
       ContextProvider(Opts.ContextProvider), CDB(CDB), Callbacks(Callbacks),
       Barrier(Barrier), Done(false), Status(FileName, Callbacks),
       PreamblePeer(FileName, Callbacks, Opts.StorePreamblesInMemory, RunSync,
-                   Opts.PreambleThrottler, Status, HeaderIncluders, *this) {
+                   Opts.PreambleThrottler, Status, HeaderIncluders, *this,
+                   Opts.PreambleStorageHandle) {
   // Set a fallback command because compile command can be accessed before
   // `Inputs` is initialized. Other fields are only used after initialization
   // from client inputs.
@@ -1089,7 +1092,7 @@ void PreambleThread::build(Request Req) {
         Callbacks.onPreambleAST(FileName, Inputs.Version, std::move(ASTCtx),
                                 std::move(PI));
       },
-      &Stats);
+      &Stats, Storage);
   if (!LatestBuild)
     return;
   reportPreambleBuild(Stats, IsFirstPreamble);
