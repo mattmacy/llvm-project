@@ -73,6 +73,18 @@ bool containsClassSpecWithBuiltinArg(const llvm::DenseSet<const Decl *> &Set,
   return false;
 }
 
+llvm::DenseSet<const Decl *> runConservative(llvm::StringRef HeaderCode,
+                                             llvm::StringRef Code) {
+  TestTU TU;
+  TU.HeaderCode = std::string(HeaderCode);
+  TU.Code = std::string(Code);
+  auto AST = TU.build();
+  auto ROpt = computeReachablePreambleDecls(AST.getASTContext(), AST.getSema(),
+                                            PreambleASTPruning::Conservative);
+  EXPECT_TRUE(ROpt.has_value());
+  return ROpt ? std::move(*ROpt) : llvm::DenseSet<const Decl *>();
+}
+
 TEST(PreamblePruningTest, KeepsBodyReachableDecls) {
   TestTU TU;
   TU.HeaderCode = R"cpp(
@@ -148,6 +160,66 @@ TEST(PreamblePruningTest, OffTierReturnsNullopt) {
   auto ROpt = computeReachablePreambleDecls(AST.getASTContext(), AST.getSema(),
                                             PreambleASTPruning::Off);
   EXPECT_FALSE(ROpt.has_value());
+}
+
+TEST(PreamblePruningTest, ConservativeKeepsFieldDeclInClassInits) {
+  auto Kept = runConservative(R"cpp(
+    inline int compute();
+    struct S { int x = compute(); };
+  )cpp",
+                              "S s;");
+  EXPECT_TRUE(containsDeclNamed(Kept, "compute"));
+}
+
+TEST(PreamblePruningTest, ConservativeKeepsDefaultTemplateArg) {
+  auto Kept = runConservative(R"cpp(
+    struct DefAlloc {};
+    template <class T, class A = DefAlloc> struct V { A alloc; };
+  )cpp",
+                              "V<int> v;");
+  EXPECT_TRUE(containsDeclNamed(Kept, "DefAlloc"));
+}
+
+TEST(PreamblePruningTest, ConservativeKeepsNNSChain) {
+  auto Kept = runConservative(R"cpp(
+    namespace N {
+    struct Outer { static int value; };
+    struct S { int x = N::Outer::value; };
+    } // namespace N
+  )cpp",
+                              "N::S s;");
+  EXPECT_TRUE(containsDeclNamed(Kept, "Outer"));
+  EXPECT_TRUE(containsDeclNamed(Kept, "value"));
+}
+
+TEST(PreamblePruningTest, ConservativeKeepsLambdaCapture) {
+  auto Kept = runConservative(R"cpp(
+    inline int helper();
+    struct S { int y = [x = helper()] { return x; }(); };
+  )cpp",
+                              "S s;");
+  EXPECT_TRUE(containsDeclNamed(Kept, "x"));
+}
+
+TEST(PreamblePruningTest, ConservativeKeepsADLBegin) {
+  auto Kept = runConservative(R"cpp(
+    namespace N {
+    struct R {};
+    inline int *begin(R &);
+    inline int *end(R &);
+    struct S {
+      int x = [] {
+        R r;
+        for (auto y : r) {
+        }
+        return 0;
+      }();
+    };
+    } // namespace N
+  )cpp",
+                              "N::S s;");
+  EXPECT_TRUE(containsDeclNamed(Kept, "begin"));
+  EXPECT_TRUE(containsDeclNamed(Kept, "end"));
 }
 
 } // namespace

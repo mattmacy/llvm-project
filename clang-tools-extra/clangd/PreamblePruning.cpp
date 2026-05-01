@@ -84,6 +84,143 @@ struct ReachabilityWalker {
       Worklist.push_back(D);
   }
 
+  void addType(QualType QT) {
+    for (const Decl *D : underlyingDecls(QT))
+      enqueue(D);
+  }
+
+  void closeOverNNS(const NestedNameSpecifier *NNS) {
+    while (NNS) {
+      switch (NNS->getKind()) {
+      case NestedNameSpecifier::Namespace:
+        enqueue(NNS->getAsNamespace());
+        break;
+      case NestedNameSpecifier::NamespaceAlias:
+        enqueue(NNS->getAsNamespaceAlias());
+        break;
+      case NestedNameSpecifier::TypeSpec:
+      case NestedNameSpecifier::TypeSpecWithTemplate:
+        addType(QualType(NNS->getAsType(), 0));
+        break;
+      case NestedNameSpecifier::Super:
+        enqueue(NNS->getAsRecordDecl());
+        break;
+      case NestedNameSpecifier::Identifier:
+      case NestedNameSpecifier::Global:
+        break;
+      }
+      NNS = NNS->getPrefix();
+    }
+  }
+
+  void closeOverTemplateArg(const TemplateArgument &TA) {
+    using Kind = TemplateArgument::ArgKind;
+    switch (TA.getKind()) {
+    case Kind::Null:
+      break;
+    case Kind::Type:
+      addType(TA.getAsType());
+      break;
+    case Kind::Declaration:
+      enqueue(TA.getAsDecl());
+      break;
+    case Kind::NullPtr:
+      addType(TA.getNullPtrType());
+      break;
+    case Kind::Integral:
+      addType(TA.getIntegralType());
+      break;
+    case Kind::Template:
+    case Kind::TemplateExpansion:
+      if (auto *D = TA.getAsTemplate().getAsTemplateDecl())
+        enqueue(D);
+      break;
+    case Kind::Expression:
+      walkExpr(TA.getAsExpr());
+      break;
+    case Kind::StructuralValue:
+      addType(TA.getStructuralValueType());
+      break;
+    case Kind::Pack:
+      for (const TemplateArgument &Inner : TA.pack_elements())
+        closeOverTemplateArg(Inner);
+      break;
+    }
+  }
+
+  void closeOverTemplateArgs(const TemplateArgumentList &Args) {
+    for (const TemplateArgument &TA : Args.asArray())
+      closeOverTemplateArg(TA);
+  }
+
+  void closeOverADLCustomizationPoints(QualType QT) {
+    static constexpr llvm::StringLiteral CPFns[] = {
+        "begin", "end",   "cbegin", "cend", "rbegin",
+        "rend",  "swap",  "size",   "data", "empty",
+    };
+    llvm::SmallVector<const NamespaceDecl *, 4> Namespaces;
+    for (const Decl *D : underlyingDecls(QT)) {
+      const DeclContext *DC = D->getDeclContext();
+      while (DC && !DC->isTranslationUnit()) {
+        if (const auto *NS = dyn_cast<NamespaceDecl>(DC)) {
+          bool Seen = false;
+          for (const NamespaceDecl *SeenNS : Namespaces) {
+            if (SeenNS == NS) {
+              Seen = true;
+              break;
+            }
+          }
+          if (!Seen)
+            Namespaces.push_back(NS);
+        }
+        DC = DC->getParent();
+      }
+    }
+    for (const NamespaceDecl *NS : Namespaces) {
+      for (const Decl *Member : NS->decls()) {
+        const auto *ND = dyn_cast<NamedDecl>(Member);
+        if (!ND)
+          continue;
+        const IdentifierInfo *II = ND->getIdentifier();
+        if (!II)
+          continue;
+        llvm::StringRef Name = II->getName();
+        bool Match = false;
+        for (llvm::StringLiteral CPFn : CPFns) {
+          if (Name == CPFn) {
+            Match = true;
+            break;
+          }
+        }
+        if (!Match)
+          continue;
+        if (isa<FunctionDecl>(ND) || isa<FunctionTemplateDecl>(ND))
+          enqueue(ND);
+      }
+    }
+  }
+
+  void closeTemplateParameterDefaults(const TemplateParameterList *Params) {
+    if (!Params)
+      return;
+    for (const NamedDecl *Param : *Params) {
+      if (const auto *TTP = dyn_cast<TemplateTypeParmDecl>(Param)) {
+        if (TTP->hasDefaultArgument())
+          closeOverTemplateArg(TTP->getDefaultArgument().getArgument());
+        continue;
+      }
+      if (const auto *NTTP = dyn_cast<NonTypeTemplateParmDecl>(Param)) {
+        if (NTTP->hasDefaultArgument())
+          closeOverTemplateArg(NTTP->getDefaultArgument().getArgument());
+        continue;
+      }
+      if (const auto *TTPD = dyn_cast<TemplateTemplateParmDecl>(Param)) {
+        if (TTPD->hasDefaultArgument())
+          closeOverTemplateArg(TTPD->getDefaultArgument().getArgument());
+      }
+    }
+  }
+
   llvm::ArrayRef<const Decl *> underlyingDecls(QualType QT) {
     if (QT.isNull())
       return {};
@@ -138,30 +275,98 @@ struct ReachabilityWalker {
     }
     bool VisitDeclRefExpr(DeclRefExpr *E) {
       W.enqueue(E->getDecl());
+      if (NestedNameSpecifierLoc Q = E->getQualifierLoc())
+        W.closeOverNNS(Q.getNestedNameSpecifier());
       return true;
     }
     bool VisitMemberExpr(MemberExpr *E) {
       W.enqueue(E->getMemberDecl());
+      if (NestedNameSpecifierLoc Q = E->getQualifierLoc())
+        W.closeOverNNS(Q.getNestedNameSpecifier());
       return true;
     }
     bool VisitCXXConstructExpr(CXXConstructExpr *E) {
       W.enqueue(E->getConstructor());
-      for (const Decl *D : W.underlyingDecls(E->getType()))
-        W.enqueue(D);
+      W.addType(E->getType());
       return true;
     }
     bool VisitCXXTemporaryObjectExpr(CXXTemporaryObjectExpr *E) {
-      for (const Decl *D : W.underlyingDecls(E->getType()))
+      W.enqueue(E->getConstructor());
+      W.addType(E->getType());
+      return true;
+    }
+    bool VisitCallExpr(CallExpr *E) {
+      W.enqueue(E->getDirectCallee());
+      return true;
+    }
+    bool VisitCXXOperatorCallExpr(CXXOperatorCallExpr *E) {
+      W.enqueue(E->getDirectCallee());
+      return true;
+    }
+    bool VisitCXXMemberCallExpr(CXXMemberCallExpr *E) {
+      W.enqueue(E->getMethodDecl());
+      return true;
+    }
+    bool VisitCXXDependentScopeMemberExpr(CXXDependentScopeMemberExpr *E) {
+      if (NestedNameSpecifierLoc Q = E->getQualifierLoc())
+        W.closeOverNNS(Q.getNestedNameSpecifier());
+      return true;
+    }
+    bool VisitUnresolvedLookupExpr(UnresolvedLookupExpr *E) {
+      for (NamedDecl *D : E->decls())
         W.enqueue(D);
+      return true;
+    }
+    bool VisitUnresolvedMemberExpr(UnresolvedMemberExpr *E) {
+      for (NamedDecl *D : E->decls())
+        W.enqueue(D);
+      return true;
+    }
+    bool VisitLambdaExpr(LambdaExpr *E) {
+      for (const LambdaCapture &Cap : E->captures()) {
+        if (Cap.capturesVariable())
+          W.enqueue(Cap.getCapturedVar());
+      }
+      return true;
+    }
+    bool VisitCXXForRangeStmt(CXXForRangeStmt *S) {
+      W.enqueue(S->getLoopVariable());
+      if (const Expr *Range = S->getRangeInit()) {
+        W.addType(Range->getType());
+        W.closeOverADLCustomizationPoints(Range->getType());
+      }
+      W.walkStmt(S->getBeginStmt());
+      W.walkStmt(S->getEndStmt());
+      return true;
+    }
+    bool VisitCXXNewExpr(CXXNewExpr *E) {
+      W.enqueue(E->getOperatorNew());
+      return true;
+    }
+    bool VisitCXXDeleteExpr(CXXDeleteExpr *E) {
+      W.enqueue(E->getOperatorDelete());
       return true;
     }
   };
 
-  void walkExpr(const Expr *E) {
-    if (!E)
+  void walkStmt(const Stmt *S) {
+    if (!S)
       return;
     ExprWalker EW(*this);
-    EW.TraverseStmt(const_cast<Expr *>(E));
+    EW.TraverseStmt(const_cast<Stmt *>(S));
+  }
+
+  void walkExpr(const Expr *E) {
+    walkStmt(E);
+  }
+
+  void closeOverFieldInits(const CXXRecordDecl *RD) {
+    if (!RD)
+      return;
+    for (const FieldDecl *FD : RD->fields()) {
+      if (const Expr *Init = FD->getInClassInitializer())
+        walkExpr(Init);
+    }
   }
 
   // Plan §3.3.1 seed.
@@ -205,12 +410,15 @@ struct ReachabilityWalker {
     if (!R || !R->hasDefinition())
       return;
     for (const auto &B : R->bases())
-      for (const Decl *D : underlyingDecls(B.getType()))
-        enqueue(D);
+      addType(B.getType());
+    closeOverFieldInits(R);
     if (auto *CTD = R->getDescribedClassTemplate())
       enqueue(CTD);
     if (auto *Spec = dyn_cast<ClassTemplateSpecializationDecl>(R))
-      enqueue(Spec->getSpecializedTemplate());
+      if (auto *Primary = Spec->getSpecializedTemplate()) {
+        enqueue(Primary);
+        closeOverTemplateArgs(Spec->getTemplateArgs());
+      }
     for (const Decl *Member : R->decls()) {
       enqueue(Member);
       if (const auto *FD = dyn_cast<FunctionDecl>(Member)) {
@@ -234,28 +442,29 @@ struct ReachabilityWalker {
   void closeFunction(const FunctionDecl *F) {
     if (!F)
       return;
-    for (const Decl *D : underlyingDecls(F->getReturnType()))
-      enqueue(D);
+    addType(F->getReturnType());
     for (const ParmVarDecl *P : F->parameters()) {
-      for (const Decl *D : underlyingDecls(P->getType()))
-        enqueue(D);
+      addType(P->getType());
       if (P->hasDefaultArg() && !P->hasUninstantiatedDefaultArg()) {
         if (const Expr *DE = P->getDefaultArg())
           walkExpr(DE);
       }
     }
+    if (const Stmt *Body = F->getBody())
+      walkStmt(Body);
     if (auto *FTD = F->getDescribedFunctionTemplate())
       enqueue(FTD);
     if (auto *Primary = F->getPrimaryTemplate())
       enqueue(Primary);
+    if (const TemplateArgumentList *Args = F->getTemplateSpecializationArgs())
+      closeOverTemplateArgs(*Args);
   }
 
   // Plan §3.3.2 step 4.
   void closeVar(const VarDecl *V) {
     if (!V)
       return;
-    for (const Decl *D : underlyingDecls(V->getType()))
-      enqueue(D);
+    addType(V->getType());
     if (V->hasInit())
       walkExpr(V->getInit());
   }
@@ -264,8 +473,7 @@ struct ReachabilityWalker {
   void closeTypedef(const TypedefNameDecl *T) {
     if (!T)
       return;
-    for (const Decl *D : underlyingDecls(T->getUnderlyingType()))
-      enqueue(D);
+    addType(T->getUnderlyingType());
   }
 
   // Plan §3.3.2 step 6.
@@ -274,6 +482,19 @@ struct ReachabilityWalker {
       return;
     for (auto It = U->shadow_begin(); It != U->shadow_end(); ++It)
       enqueue(*It);
+  }
+
+  void closeClassTemplate(const ClassTemplateDecl *CTD) {
+    if (!CTD)
+      return;
+    enqueue(CTD->getTemplatedDecl());
+    closeTemplateParameterDefaults(CTD->getTemplateParameters());
+  }
+
+  void closeFunctionTemplate(const FunctionTemplateDecl *FTD) {
+    if (!FTD)
+      return;
+    enqueue(FTD->getTemplatedDecl());
   }
 
   // Plan §3.3.2 step 7 RESTRICTIVE + step 8 explicit-spec rule. Iterate
@@ -344,6 +565,10 @@ struct ReachabilityWalker {
           closeTypedef(T);
         else if (const auto *U = dyn_cast<UsingDecl>(D))
           closeUsing(U);
+        else if (const auto *CTD = dyn_cast<ClassTemplateDecl>(D))
+          closeClassTemplate(CTD);
+        else if (const auto *FTD = dyn_cast<FunctionTemplateDecl>(D))
+          closeFunctionTemplate(FTD);
       }
       if (!collectRestrictiveSpecs())
         break;
