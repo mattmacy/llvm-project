@@ -242,6 +242,52 @@ SlabTuple indexHeaderSymbols(llvm::StringRef Version, ASTContext &AST,
 FileSymbols::FileSymbols(IndexContents IdxContents)
     : IdxContents(IdxContents) {}
 
+// LURE-local: helpers used by update() to keep the LRU + byte counters
+// consistent with the SymbolsSnapshot / RefsSnapshot / RelationsSnapshot
+// state. Caller must hold Mutex.
+//
+// We approximate the resident cost of a (Symbols, Refs, Relations) triple
+// as the sum of the three slabs' bytes() values plus the per-key overhead
+// of one llvm::StringMap entry per snapshot map. Slab::bytes() is the
+// dominant term (KB-MB per file vs sub-KB map overhead) so we don't try
+// to be more precise than that.
+static size_t slabsBytes(const SymbolSlab *Symbols, const RefSlab *Refs,
+                         const RelationSlab *Relations) {
+  size_t Bytes = 0;
+  if (Symbols)
+    Bytes += Symbols->bytes();
+  if (Refs)
+    Bytes += Refs->bytes();
+  if (Relations)
+    Bytes += Relations->bytes();
+  return Bytes;
+}
+
+void FileSymbols::setMemoryLimit(size_t Bytes) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  MemoryLimit = Bytes;
+  // If the new limit is smaller than current resident size, evict
+  // immediately (before next update()). Front of LRU = oldest.
+  while (MemoryLimit != 0 && TotalBytes > MemoryLimit && !LRU.empty()) {
+    const std::string Victim = LRU.front();
+    LRU.pop_front();
+    LRUPos.erase(Victim);
+    auto It = KeyBytes.find(Victim);
+    if (It != KeyBytes.end()) {
+      TotalBytes -= It->second;
+      KeyBytes.erase(It);
+    }
+    SymbolsSnapshot.erase(Victim);
+    RefsSnapshot.erase(Victim);
+    RelationsSnapshot.erase(Victim);
+  }
+}
+
+size_t FileSymbols::residentBytes() const {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  return TotalBytes;
+}
+
 void FileSymbols::update(llvm::StringRef Key,
                          std::unique_ptr<SymbolSlab> Symbols,
                          std::unique_ptr<RefSlab> Refs,
@@ -249,6 +295,20 @@ void FileSymbols::update(llvm::StringRef Key,
                          bool CountReferences) {
   std::lock_guard<std::mutex> Lock(Mutex);
   ++Version;
+
+  // Compute byte cost of the new state for this key. If all three are
+  // null, the entry is being removed.
+  const size_t NewBytes =
+      slabsBytes(Symbols.get(), Refs.get(), Relations.get());
+  const bool Removing = (NewBytes == 0 && !Symbols && !Refs && !Relations);
+
+  // Subtract the old byte cost (if any) from the running total.
+  auto OldIt = KeyBytes.find(Key);
+  if (OldIt != KeyBytes.end()) {
+    TotalBytes -= OldIt->second;
+    KeyBytes.erase(OldIt);
+  }
+
   if (!Symbols)
     SymbolsSnapshot.erase(Key);
   else
@@ -265,6 +325,42 @@ void FileSymbols::update(llvm::StringRef Key,
     RelationsSnapshot.erase(Key);
   else
     RelationsSnapshot[Key] = std::move(Relations);
+
+  // Update LRU + byte total to reflect the new state for this key.
+  auto LRUIt = LRUPos.find(Key);
+  if (Removing) {
+    if (LRUIt != LRUPos.end()) {
+      LRU.erase(LRUIt->second);
+      LRUPos.erase(LRUIt);
+    }
+  } else {
+    KeyBytes[Key] = NewBytes;
+    TotalBytes += NewBytes;
+    if (LRUIt != LRUPos.end())
+      LRU.erase(LRUIt->second);
+    LRU.push_back(Key.str());
+    LRUPos[Key] = std::prev(LRU.end());
+  }
+
+  // Evict from the front of LRU until under the limit. We deliberately
+  // do not re-evict the key we just inserted: if a single update brings
+  // resident size above the limit on its own, we accept the overshoot
+  // for this file because evicting it immediately would mean losing the
+  // work the indexer just did.
+  while (MemoryLimit != 0 && TotalBytes > MemoryLimit && !LRU.empty() &&
+         LRU.front() != Key) {
+    const std::string Victim = LRU.front();
+    LRU.pop_front();
+    LRUPos.erase(Victim);
+    auto It = KeyBytes.find(Victim);
+    if (It != KeyBytes.end()) {
+      TotalBytes -= It->second;
+      KeyBytes.erase(It);
+    }
+    SymbolsSnapshot.erase(Victim);
+    RefsSnapshot.erase(Victim);
+    RelationsSnapshot.erase(Victim);
+  }
 }
 
 std::unique_ptr<SymbolIndex>

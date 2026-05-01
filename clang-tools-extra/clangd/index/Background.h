@@ -145,6 +145,12 @@ public:
     // file. Called with the empty string for other tasks.
     // (When called, the context from BackgroundIndex construction is active).
     std::function<Context(PathRef)> ContextProvider = nullptr;
+    // LURE-local: cap resident size of merged background index in memory.
+    // 0 = unbounded (upstream behavior). When set, FileSymbols evicts the
+    // least-recently-updated file's slabs once the merged-index resident
+    // size exceeds this limit; queries against an evicted file's symbols
+    // lazy-reload from the on-disk shard.
+    size_t MemoryLimit = 0;
   };
 
   /// Creates a new background index and starts its threads.
@@ -199,6 +205,10 @@ private:
   const GlobalCompilationDatabase &CDB;
   llvm::ThreadPriority IndexingPriority;
   std::function<Context(PathRef)> ContextProvider;
+  // LURE-local: cap on resident size of merged background index, in
+  // bytes. 0 = unbounded (upstream behavior). Phase-1 stores only;
+  // FileSymbols-side eviction lands in a follow-up commit.
+  size_t MemoryLimit = 0;
 
   llvm::Error index(tooling::CompileCommand);
 

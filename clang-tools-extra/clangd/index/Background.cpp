@@ -96,6 +96,7 @@ BackgroundIndex::BackgroundIndex(
     : SwapIndex(std::make_unique<MemIndex>()), TFS(TFS), CDB(CDB),
       IndexingPriority(Opts.IndexingPriority),
       ContextProvider(std::move(Opts.ContextProvider)),
+      MemoryLimit(Opts.MemoryLimit),
       IndexedSymbols(IndexContents::All),
       Rebuilder(this, &IndexedSymbols, Opts.ThreadPoolSize),
       IndexStorageFactory(std::move(IndexStorageFactory)),
@@ -106,6 +107,10 @@ BackgroundIndex::BackgroundIndex(
           })) {
   assert(Opts.ThreadPoolSize > 0 && "Thread pool size can't be zero.");
   assert(this->IndexStorageFactory && "Storage factory can not be null!");
+  // LURE-local: propagate memory cap into FileSymbols. 0 (the
+  // default) leaves upstream unbounded behavior in place.
+  if (MemoryLimit != 0)
+    IndexedSymbols.setMemoryLimit(MemoryLimit);
   for (unsigned I = 0; I < Opts.ThreadPoolSize; ++I) {
     ThreadPool.runAsync("background-worker-" + llvm::Twine(I + 1),
                         [this, Ctx(Context::current().clone())]() mutable {

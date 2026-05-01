@@ -186,6 +186,23 @@ opt<llvm::ThreadPriority> BackgroundIndexPriority{
     init(llvm::ThreadPriority::Low),
 };
 
+// LURE-local extension: cap resident size of the merged background index.
+// Disk shards remain authoritative; under pressure clangd evicts the
+// least-recently-updated file's slabs from memory and faults them back in
+// from disk on demand. Empty/unset (default) preserves upstream unbounded
+// behavior. Suffixes K/M/G accepted; parsed in main().
+opt<std::string> BackgroundIndexMemoryLimit{
+    "background-index-memory-limit",
+    cat(Features),
+    desc("Cap resident size (bytes) of the merged background index in memory. "
+         "Suffixes K/M/G accepted. Empty (default) = unbounded (upstream "
+         "behavior). When set, the least-recently-updated file's slabs are "
+         "evicted from memory once the merged-index resident size exceeds the "
+         "limit; the evicted file's symbols are reloaded lazily from its "
+         "on-disk shard (--background-index must be on for lazy reload)."),
+    init(""),
+};
+
 opt<bool> EnableClangTidy{
     "clang-tidy",
     cat(Features),
@@ -898,6 +915,29 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
 #endif
   Opts.BackgroundIndex = EnableBackgroundIndex;
   Opts.BackgroundIndexPriority = BackgroundIndexPriority;
+  // LURE-local: parse --background-index-memory-limit=<bytes>[K|M|G].
+  // Empty / "0" = unbounded (upstream behavior).
+  if (!BackgroundIndexMemoryLimit.empty()) {
+    llvm::StringRef Spec = BackgroundIndexMemoryLimit;
+    uint64_t Mult = 1;
+    if (Spec.ends_with_insensitive("k")) {
+      Mult = 1ull << 10;
+      Spec = Spec.drop_back(1);
+    } else if (Spec.ends_with_insensitive("m")) {
+      Mult = 1ull << 20;
+      Spec = Spec.drop_back(1);
+    } else if (Spec.ends_with_insensitive("g")) {
+      Mult = 1ull << 30;
+      Spec = Spec.drop_back(1);
+    }
+    uint64_t Raw = 0;
+    if (Spec.getAsInteger(10, Raw)) {
+      llvm::errs() << "--background-index-memory-limit: cannot parse '"
+                   << BackgroundIndexMemoryLimit << "'\n";
+      return 1;
+    }
+    Opts.BackgroundIndexMemoryLimit = Raw * Mult;
+  }
   Opts.ReferencesLimit = ReferencesLimit;
   Opts.Rename.LimitFiles = RenameFileLimit;
   auto PAI = createProjectAwareIndex(loadExternalIndex, Sync);

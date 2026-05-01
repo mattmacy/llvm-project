@@ -123,6 +123,10 @@ public:
     /// on background threads. The index is stored in the project root.
     bool BackgroundIndex = false;
     llvm::ThreadPriority BackgroundIndexPriority = llvm::ThreadPriority::Low;
+    // LURE-local: cap resident size of merged background index, in bytes.
+    // 0 = unbounded (upstream behavior). See
+    // tool/ClangdMain.cpp `--background-index-memory-limit`.
+    size_t BackgroundIndexMemoryLimit = 0;
 
     /// If set, use this index to augment code completion results.
     SymbolIndex *StaticIndex = nullptr;

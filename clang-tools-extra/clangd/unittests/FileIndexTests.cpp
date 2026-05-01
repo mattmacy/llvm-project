@@ -146,6 +146,76 @@ TEST(FileSymbolsTest, MergeOverlap) {
             AllOf(qName("x"), declURI("file:///x1"), defURI("file:///x2"))));
 }
 
+// LURE-local tests for FileSymbols::setMemoryLimit. The cap evicts
+// the least-recently-updated key first; a key that exceeds the cap on
+// its own is allowed to overshoot rather than self-evict (we'd lose
+// the work the indexer just did).
+TEST(FileSymbolsTest, MemoryLimitEvictsLRU) {
+  FileSymbols FS(IndexContents::All);
+
+  // Insert three keys, then set a limit that fits ~one of them.
+  FS.update("f1", numSlab(1, 50), nullptr, nullptr, false);
+  const size_t F1Bytes = FS.residentBytes();
+  ASSERT_GT(F1Bytes, 0u);
+  FS.update("f2", numSlab(51, 100), nullptr, nullptr, false);
+  FS.update("f3", numSlab(101, 150), nullptr, nullptr, false);
+
+  // setMemoryLimit shrinks-on-set: oldest (f1, then f2) should drop
+  // until resident is at-or-below the limit.
+  FS.setMemoryLimit(F1Bytes);
+  EXPECT_LE(FS.residentBytes(), F1Bytes);
+  // f3 (most recently updated) MUST remain.
+  auto Idx = FS.buildIndex(IndexType::Light);
+  auto Names = runFuzzyFind(*Idx, "");
+  EXPECT_THAT(Names, ::testing::Contains(qName("101")));
+  EXPECT_THAT(Names, ::testing::Not(::testing::Contains(qName("1"))));
+}
+
+TEST(FileSymbolsTest, MemoryLimitEvictsOnUpdate) {
+  FileSymbols FS(IndexContents::All);
+  FS.update("f1", numSlab(1, 50), nullptr, nullptr, false);
+  const size_t F1Bytes = FS.residentBytes();
+
+  // Limit fits exactly one key. Adding a second should evict f1.
+  FS.setMemoryLimit(F1Bytes);
+  FS.update("f2", numSlab(51, 100), nullptr, nullptr, false);
+
+  auto Idx = FS.buildIndex(IndexType::Light);
+  auto Names = runFuzzyFind(*Idx, "");
+  EXPECT_THAT(Names, ::testing::Contains(qName("51")));
+  EXPECT_THAT(Names, ::testing::Not(::testing::Contains(qName("1"))));
+}
+
+TEST(FileSymbolsTest, MemoryLimitDoesNotSelfEvict) {
+  FileSymbols FS(IndexContents::All);
+  FS.update("f1", numSlab(1, 50), nullptr, nullptr, false);
+  const size_t F1Bytes = FS.residentBytes();
+
+  // Cap *below* what f1 alone needs. f1 stays — we don't evict the
+  // key the indexer just inserted, even when it overshoots.
+  FS.setMemoryLimit(F1Bytes / 2);
+  // Force an update that re-inserts f1 (same key).
+  FS.update("f1", numSlab(1, 50), nullptr, nullptr, false);
+
+  auto Idx = FS.buildIndex(IndexType::Light);
+  auto Names = runFuzzyFind(*Idx, "");
+  EXPECT_THAT(Names, ::testing::Contains(qName("1")));
+}
+
+TEST(FileSymbolsTest, MemoryLimitZeroIsUnbounded) {
+  FileSymbols FS(IndexContents::All);
+  FS.update("f1", numSlab(1, 50), nullptr, nullptr, false);
+  FS.update("f2", numSlab(51, 100), nullptr, nullptr, false);
+  FS.setMemoryLimit(0); // unbounded
+  FS.update("f3", numSlab(101, 150), nullptr, nullptr, false);
+
+  auto Idx = FS.buildIndex(IndexType::Light);
+  auto Names = runFuzzyFind(*Idx, "");
+  EXPECT_THAT(Names, ::testing::Contains(qName("1")));
+  EXPECT_THAT(Names, ::testing::Contains(qName("51")));
+  EXPECT_THAT(Names, ::testing::Contains(qName("101")));
+}
+
 TEST(FileSymbolsTest, SnapshotAliveAfterRemove) {
   FileSymbols FS(IndexContents::All);
 

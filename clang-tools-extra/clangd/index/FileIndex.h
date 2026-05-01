@@ -32,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <vector>
+#include <list>
 
 namespace clang {
 class ASTContext;
@@ -89,6 +90,14 @@ public:
 
   void profile(MemoryTree &MT) const;
 
+  // LURE-local: cap on resident size of stored slabs (in bytes).
+  // 0 = unbounded (upstream behavior). Eviction policy is
+  // least-recently-updated. Disk shards remain authoritative;
+  // evicted files are simply absent from the next buildIndex()
+  // call until the background indexer re-touches them.
+  void setMemoryLimit(size_t Bytes);
+  size_t residentBytes() const;
+
 private:
   IndexContents IdxContents;
 
@@ -102,6 +111,15 @@ private:
   llvm::StringMap<std::shared_ptr<SymbolSlab>> SymbolsSnapshot;
   llvm::StringMap<RefSlabAndCountReferences> RefsSnapshot;
   llvm::StringMap<std::shared_ptr<RelationSlab>> RelationsSnapshot;
+
+  // LURE-local: byte accounting + LRU for memory-limit eviction.
+  // Updated under Mutex by update(); read under Mutex by
+  // residentBytes(). 0 == no cap configured.
+  size_t MemoryLimit = 0;
+  size_t TotalBytes = 0;
+  llvm::StringMap<size_t> KeyBytes;
+  std::list<std::string> LRU; // front = least recent
+  llvm::StringMap<std::list<std::string>::iterator> LRUPos;
 };
 
 /// This manages symbols from files and an in-memory index on all symbols.
