@@ -33,6 +33,7 @@
 #include "clang/Format/Format.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
@@ -51,6 +52,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <deque>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -68,6 +70,64 @@ bool check(const llvm::StringRef File, const ThreadsafeFS &TFS,
            const ClangdLSPServer::Options &Opts);
 
 namespace {
+
+// LURE-local: bound the number of preamble builds in flight by
+// implementing the existing clangd PreambleThrottler interface.
+// Each preamble build holds a full Clang AST + temporary buffers
+// (~3-5 GB on UE TUs); -j=10 was peaking RSS at ~40 GB on the
+// workspace box during cold-pass indexing. Capping the in-flight
+// preamble count without lowering -j keeps the rest of the
+// indexer (symbol-collection, shard-write) running fully
+// parallel while bounding the preamble peak.
+//
+// All callbacks fire under the lock; the receiver only sets an
+// atomic + notifies a condition_variable
+// (PreambleThrottlerRequest::PreambleThrottlerRequest in
+// TUScheduler.cpp), so this is bounded work.
+class BoundedPreambleThrottler : public clangd::PreambleThrottler {
+public:
+  explicit BoundedPreambleThrottler(unsigned MaxInFlight)
+      : MaxInFlight(MaxInFlight) {}
+
+  RequestID acquire(llvm::StringRef Filename, Callback Cb) override {
+    std::lock_guard<std::mutex> L(Mu);
+    RequestID ID = NextID++;
+    if (Granted.size() < MaxInFlight) {
+      Granted.insert(ID);
+      Cb();
+    } else {
+      Pending.emplace_back(ID, std::move(Cb));
+    }
+    return ID;
+  }
+
+  void release(RequestID ID) override {
+    std::lock_guard<std::mutex> L(Mu);
+    auto It = Granted.find(ID);
+    if (It != Granted.end()) {
+      Granted.erase(It);
+      if (!Pending.empty()) {
+        auto Front = std::move(Pending.front());
+        Pending.pop_front();
+        Granted.insert(Front.first);
+        Front.second();
+      }
+      return;
+    }
+    auto P = std::find_if(Pending.begin(), Pending.end(),
+                          [ID](const auto &Q) { return Q.first == ID; });
+    if (P != Pending.end())
+      Pending.erase(P);
+  }
+
+private:
+  const unsigned MaxInFlight;
+  std::mutex Mu;
+  RequestID NextID = 1;
+  llvm::DenseSet<RequestID> Granted;
+  std::deque<std::pair<RequestID, Callback>> Pending;
+};
+
 
 using llvm::cl::cat;
 using llvm::cl::CommaSeparated;
@@ -191,6 +251,22 @@ opt<llvm::ThreadPriority> BackgroundIndexPriority{
 // least-recently-updated file's slabs from memory and faults them back in
 // from disk on demand. Empty/unset (default) preserves upstream unbounded
 // behavior. Suffixes K/M/G accepted; parsed in main().
+opt<unsigned> MaxConcurrentPreambleBuilds{
+    "max-concurrent-preamble-builds",
+    cat(Misc),
+    desc("LURE-local: cap the number of concurrent preamble builds "
+         "in flight, regardless of -j. Each in-flight preamble holds a "
+         "full Clang AST + temporary buffers (~3-5 GB on UE TUs); the "
+         "indexing storm at -j=10 was peaking around 40 GB resident on "
+         "the workspace box. Setting this to N caps simultaneous "
+         "preamble builds at N while leaving the rest of the indexer "
+         "(symbol-collection, shard-write) running at full -j. 0 = "
+         "unbounded (upstream behavior). Independent of "
+         "--background-index-memory-limit, which caps the *merged* "
+         "background index, not the per-worker preamble peak."),
+    init(0),
+};
+
 opt<std::string> BackgroundIndexMemoryLimit{
     "background-index-memory-limit",
     cat(Features),
@@ -943,6 +1019,16 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
   auto PAI = createProjectAwareIndex(loadExternalIndex, Sync);
   Opts.StaticIndex = PAI.get();
   Opts.AsyncThreadsCount = WorkerThreadsCount;
+  // LURE-local: instantiate the bounded preamble throttler when
+  // --max-concurrent-preamble-builds is set. The static keeps the
+  // throttler alive for the process lifetime; ClangdServer borrows
+  // a raw pointer to it via Opts.PreambleThrottler.
+  static std::unique_ptr<BoundedPreambleThrottler> Throttler;
+  if (MaxConcurrentPreambleBuilds > 0) {
+    Throttler =
+        std::make_unique<BoundedPreambleThrottler>(MaxConcurrentPreambleBuilds);
+    Opts.PreambleThrottler = Throttler.get();
+  }
   Opts.MemoryCleanup = getMemoryCleanupFunction();
 
   Opts.CodeComplete.IncludeIneligibleResults = IncludeIneligibleResults;
